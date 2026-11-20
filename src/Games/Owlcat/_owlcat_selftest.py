@@ -517,6 +517,194 @@ def test_portrait_name_clash_left_in_place() -> None:
     print("✓ portrait name clash left in place")
 
 
+# -- Unity Mod Manager installer ----------------------------------------------
+
+_UMM_CONFIG = """<?xml version="1.0" encoding="utf-8"?>
+<Config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+\t<Repository>https://example.invalid/Repository.json</Repository>
+\t<GameInfo Name="Pathfinder: Kingmaker">
+\t\t<Folder>Pathfinder Kingmaker</Folder>
+\t\t<ModsDirectory>Mods</ModsDirectory>
+\t\t<ModInfo>Info.json</ModInfo>
+\t\t<GameExe>Kingmaker.exe</GameExe>
+\t\t<EntryPoint>[UnityEngine.UIModule.dll]UnityEngine.Canvas.cctor:Before</EntryPoint>
+\t\t<MinimalManagerVersion>0.12.0</MinimalManagerVersion>
+\t</GameInfo>
+\t<GameInfo Name="Pathfinder: Wrath of the Righteous">
+\t\t<Folder>Pathfinder Second Adventure</Folder>
+\t\t<ModsDirectory>Mods</ModsDirectory>
+\t\t<ModInfo>Info.json</ModInfo>
+\t\t<GameExe>Wrath.exe</GameExe>
+\t\t<EntryPoint>[UnityEngine.UIModule.dll]UnityEngine.Canvas.cctor:Before</EntryPoint>
+\t\t<StartingPoint>[Assembly-CSharp.dll]Kingmaker.GameStarter.Awake:Before &amp; more</StartingPoint>
+\t\t<MinimalManagerVersion>0.22.15</MinimalManagerVersion>
+\t</GameInfo>
+</Config>
+"""
+
+
+def _fake_umm(folder: Path, config: str = _UMM_CONFIG) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in ("0Harmony.dll", "dnlib.dll", "System.Xml.dll", "UnityModManager.dll",
+                 "UnityModManager.xml", "UnityModManager.exe", "Console.exe",
+                 "winhttp_x64.dll", "winhttp_x86.dll", "readme.txt"):
+        (folder / name).write_bytes(name.encode())
+    for rel in ("Harmony/1.2/0Harmony12.dll", "Harmony/1.2/0Harmony-1.2.dll",
+                "Harmony/2.2/0Harmony.dll"):
+        (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+        (folder / rel).write_bytes(rel.encode())
+    (folder / "UnityModManagerConfig.xml").write_text(config, encoding="utf-8")
+    return folder
+
+
+def _fake_game(root: Path, exe: str, *, machine: int = 0x8664,
+               system_xml: bool = True) -> Path:
+    import struct
+    root.mkdir(parents=True, exist_ok=True)
+    header = bytearray(0x80)
+    header[:2] = b"MZ"
+    header[0x3C:0x40] = struct.pack("<I", 0x40)
+    header[0x40:0x46] = b"PE\0\0" + struct.pack("<H", machine)
+    (root / exe).write_bytes(bytes(header))
+    managed = root / f"{Path(exe).stem}_Data" / "Managed"
+    managed.mkdir(parents=True)
+    if system_xml:
+        (managed / "System.Xml.dll").write_bytes(b"game")
+    return root
+
+
+def test_umm_payload_matches_doorstop_install() -> None:
+    import xml.etree.ElementTree as ET
+    from Games.Owlcat.umm_install import build_umm_payload
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = _fake_umm(root / "UnityModManagerInstaller")
+        game = _fake_game(root / "game", "Wrath.exe")
+        out = root / "payload"
+        files = build_umm_payload(source, game, "Wrath.exe", out)
+        manager = "Wrath_Data/Managed/UnityModManager"
+        assert sorted(p.as_posix() for p in files) == sorted([
+            "winhttp.dll", "doorstop_config.ini",
+            *(f"{manager}/{n}" for n in ("0Harmony.dll", "dnlib.dll", "UnityModManager.dll",
+                                         "UnityModManager.xml", "Config.xml"))]), files
+        assert (out / "winhttp.dll").read_bytes() == b"winhttp_x64.dll"
+        assert (out / "doorstop_config.ini").read_bytes() == (
+            b"[General]\r\nenabled = true\r\n"
+            b"target_assembly = Wrath_Data\\Managed\\UnityModManager\\UnityModManager.dll")
+        config = ET.parse(out / manager / "Config.xml").getroot()
+        assert config.tag == "Config"
+        assert config.get("Name") == "Pathfinder: Wrath of the Righteous"
+        assert config.findtext("GameExe") == "Wrath.exe"
+        assert config.findtext("Folder") == "Pathfinder Second Adventure"
+        assert config.findtext("StartingPoint").endswith("& more")
+        assert config.find("Repository") is None
+        assert (out / manager / "UnityModManager.dll").read_bytes() == b"UnityModManager.dll"
+    print("✓ UMM payload matches the Doorstop install")
+
+
+def test_umm_payload_variants() -> None:
+    from Games.Owlcat.umm_install import build_umm_payload
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = _fake_umm(root / "UnityModManagerInstaller")
+        # Game without System.Xml.dll gets UMM's copy.
+        game = _fake_game(root / "nosysxml", "Wrath.exe", system_xml=False)
+        files = build_umm_payload(source, game, "Wrath.exe", root / "p1")
+        assert Path("Wrath_Data/Managed/UnityModManager/System.Xml.dll") in files
+        # Kingmaker supports UMM < 0.22, so it also gets the Harmony 1.2 shims.
+        game = _fake_game(root / "km", "Kingmaker.exe")
+        files = {p.as_posix() for p in build_umm_payload(source, game, "Kingmaker.exe", root / "p2")}
+        assert {"Kingmaker_Data/Managed/UnityModManager/0Harmony12.dll",
+                "Kingmaker_Data/Managed/UnityModManager/0Harmony-1.2.dll"} <= files
+        assert (root / "p2" / "Kingmaker_Data/Managed/UnityModManager/0Harmony.dll"
+                ).read_bytes() == b"0Harmony.dll"
+        # A 32-bit exe gets the x86 proxy.
+        game = _fake_game(root / "x86", "Wrath.exe", machine=0x014C)
+        build_umm_payload(source, game, "Wrath.exe", root / "p3")
+        assert (root / "p3" / "winhttp.dll").read_bytes() == b"winhttp_x86.dll"
+        # The data folder keeps its on-disk spelling.
+        game = _fake_game(root / "case", "Wrath.exe")
+        (game / "Wrath_Data").rename(game / "wrath_data")
+        files = build_umm_payload(source, game, "Wrath.exe", root / "p4")
+        assert Path("wrath_data/Managed/UnityModManager/Config.xml") in files
+        assert b"target_assembly = wrath_data\\Managed" in (
+            root / "p4" / "doorstop_config.ini").read_bytes()
+    print("✓ UMM payload variants")
+
+
+def test_umm_payload_errors() -> None:
+    from Games.Owlcat.umm_install import build_umm_payload
+    from Utils.wizards.payload import PayloadInstallError
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = _fake_umm(root / "umm", _UMM_CONFIG.replace("Wrath.exe", "Other.exe"))
+        game = _fake_game(root / "game", "Wrath.exe")
+        for case in ("no game entry", "no proxy", "no data folder"):
+            if case == "no proxy":
+                source = _fake_umm(root / "umm2")
+                (source / "winhttp_x64.dll").unlink()
+            if case == "no data folder":
+                source = _fake_umm(root / "umm3")
+                game = root / "empty"
+                game.mkdir()
+            try:
+                build_umm_payload(source, game, "Wrath.exe", root / case.replace(" ", "_"))
+            except PayloadInstallError:
+                continue
+            raise AssertionError(case)
+    print("✓ UMM payload errors")
+
+
+def test_umm_prepare_from_archive() -> None:
+    import zipfile
+    from Games.Owlcat.umm_install import prepare_umm_payload
+    _km, wotr, _rt = _games()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = _fake_umm(root / "src" / "UnityModManagerInstaller")
+        archive = root / "UnityModManager 21 0.33.4.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            for path in sorted(source.rglob("*")):
+                if path.is_file():
+                    zf.write(path, path.relative_to(source.parent).as_posix())
+        wotr._game_path = _fake_game(root / "game", "Wrath.exe")
+        with prepare_umm_payload(wotr, archive) as payload:
+            assert payload.archive == archive
+            names = {p.as_posix() for p in payload.files}
+            assert "winhttp.dll" in names and "doorstop_config.ini" in names
+            assert all((payload.root / p).is_file() for p in payload.files)
+            assert not any("Console.exe" in n or "readme" in n for n in names)
+    print("✓ UMM payload from archive")
+
+
+def test_umm_wizard_tool() -> None:
+    import wizards_qt
+    km, wotr, rt = _games()
+    for game in (km, wotr):
+        tools = {tool.id: tool for tool in game.wizard_tools}
+        assert "install_reshade" in tools
+        tool = tools["install_umm"]
+        assert tool.dialog_class_path in wizards_qt.REGISTRY, tool.dialog_class_path
+    assert "install_umm" not in {tool.id for tool in rt.wizard_tools}
+    print("✓ UMM wizard tool")
+
+
+def test_umm_missing_warning_points_to_wizard() -> None:
+    _km, wotr, _rt = _games()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _point(wotr, root)
+        staging = _profile(wotr, root, ["+UmmMod"])
+        umm = staging / "UmmMod" / "Umm"
+        umm.mkdir(parents=True)
+        (umm / UMM_MANIFEST).write_text("{}")
+        wotr.pop_deploy_warnings()
+        wotr.post_deploy(lambda _m: None)
+        warnings = wotr.pop_deploy_warnings()
+        assert any("Install Unity Mod Manager" in w and "Wizard" in w for w in warnings), warnings
+    print("✓ missing-UMM warning points to the wizard")
+
+
 if __name__ == "__main__":
     test_locallow_rel_variants()
     test_classify()
@@ -545,4 +733,10 @@ if __name__ == "__main__":
     test_reserved_ids_fall_back_to_mod_name()
     test_portrait_staging()
     test_portrait_name_clash_left_in_place()
+    test_umm_payload_matches_doorstop_install()
+    test_umm_payload_variants()
+    test_umm_payload_errors()
+    test_umm_prepare_from_archive()
+    test_umm_wizard_tool()
+    test_umm_missing_warning_points_to_wizard()
     print("All Owlcat checks passed.")

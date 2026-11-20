@@ -332,6 +332,9 @@ REGISTRY: dict[str, QtWizardSpec] = {
         QtWizardSpec(_simple("wizards_qt.bg3_import_view", "BG3ImportView")),
     "wizards.sdv_smapi.SmapiWizard":
         QtWizardSpec(_simple("wizards_qt.smapi_view", "SmapiView")),
+    # Qt-only tool (Owlcat / Kingmaker + Wrath): registry key only.
+    "Games.Owlcat.umm_wizard.UmmWizard":
+        QtWizardSpec(_simple("Games.Owlcat.umm_wizard_qt", "UmmView")),
     "wizards.sr_srml.SRMLWizard":
         QtWizardSpec(_simple("wizards_qt.srml_view", "SRMLView")),
     "wizards.msc_mscloader.MSCLoaderWizard":

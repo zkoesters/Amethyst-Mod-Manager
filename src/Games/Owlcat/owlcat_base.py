@@ -332,6 +332,22 @@ class OwlcatBase(StandardCustomGame):
         return (game / f"{Path(self.exe).stem}_Data" / "Managed"
                 / "UnityModManager" / "UnityModManager.dll").is_file()
 
+    @property
+    def wizard_tools(self) -> list:
+        tools = self._base_wizard_tools()
+        if self.umm_builtin:
+            return tools
+        from Games.base_game import WizardTool
+        return tools + [WizardTool(
+            id="install_umm",
+            label="Install Unity Mod Manager",
+            description=("Install Unity Mod Manager (Doorstop Proxy) from its "
+                         "Nexus Mods archive, into the game folder or as a "
+                         "managed mod."),
+            dialog_class_path="Games.Owlcat.umm_wizard.UmmWizard",
+            category="Setup and Installers",
+        )]
+
     # -- staging ------------------------------------------------------------
 
     @property
@@ -530,8 +546,8 @@ class OwlcatBase(StandardCustomGame):
         if not self.umm_builtin and any(kind == "umm" for _n, kind in kinds) \
                 and self.framework_installed(_UMM_LABEL) is False:
             self.add_deploy_warning(
-                "Unity Mod Manager isn't installed. Run UMM's installer in this "
-                "game's Wine prefix (Doorstop Proxy method), then deploy again.")
+                "Unity Mod Manager isn't installed. Use Wizard > Install Unity "
+                "Mod Manager, then deploy again.")
         if not self.supports_template_mods:
             for name in sorted({n for n, kind in kinds if kind == "template"}):
                 self.add_deploy_warning(
